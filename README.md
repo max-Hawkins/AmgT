@@ -38,7 +38,7 @@ Then, execute the following command under `AmgT/` to compile the AmgT and test f
 
 ## Execution
 
-After the AmgT and test file are compiled, the executable files are in under the path `AmgT/AmgT_test/runnable_files/`. 
+After the AmgT and test file are compiled, the executable files are under the path `AmgT/AmgT_test/runnable_files/`. 
 
 Execute the following commands to use the AmgT:
 - Use the double-precision AmgT: `./AmgT_FP64 matrix_name.mtx` 
