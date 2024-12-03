@@ -15,6 +15,8 @@
 #include "_hypre_utilities.hpp"
 #include "seq_mv.hpp"
 
+double AVGNZCUTOFF =  0.0; // The avgnz cutoff between using TCs or Cuda cores per block
+
 double time_spmv_preprocess = 0;
 double time_spmv_sum = 0;
 int spmv_times = 0;
@@ -42,7 +44,7 @@ double csr2bsr_step3 = 0;
 #define HYPRE_CUSPARSE_SPMM_ALG CUSPARSE_CSRMM_ALG1
 #endif
 
-// #define gettimeofday1(a, b) \ 
+// #define gettimeofday1(a, b) \
 //         cudaDeviceSynchronize(); \
 //         gettimeofday(a, b)
 
@@ -1244,7 +1246,7 @@ void CSR2BSR_GPU(hypre_CSRMatrix *A)
         cudaMemcpy(&bsrmat->stand, result_gpu, sizeof(HYPRE_Real), cudaMemcpyDeviceToHost);
 
         bsrmat->stand = sqrtf(bsrmat->stand / bsrmat->blc_row);
-        
+
         // csr2bsr step 3: get the blcIdx, blcVal, blcMap
         gettimeofday(&t_start, NULL);
         cudaMalloc((void **)&bsrmat->blcIdx, sizeof(MAT_IDX_TYPE) * bsrmat->blc_num);
@@ -1325,22 +1327,24 @@ void spmv_amgT_fp64(HYPRE_Int trans,
     double stand = bsrmat->stand;
     double avgnz = bsrmat->avg_nnz;
 
+    printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
+
 #ifdef ADAPTIVE_AMGT_SPMV
-    if (stand >= 12 && avgnz >= 10)
+    if (stand >= 12 && avgnz >= AVGNZCUTOFF)
     {
         // ===tensor core, balanced===
         bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-    else if (stand >= 12 && avgnz < 10)
+    else if (stand >= 12 && avgnz < AVGNZCUTOFF)
     {
         // ===cuda core, balanced===
         bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-    else if (stand < 12 && avgnz >= 10)
+    else if (stand < 12 && avgnz >= AVGNZCUTOFF)
     {
         // ===tensor core===
         bsr_spmv_tc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
@@ -1367,6 +1371,7 @@ void spmv_amgT_fp64(HYPRE_Int trans,
     printf("spmv_kernel_n=%d\n", bsrmat->col);
     printf("spmv_kernel_time=%lf\n", time_spmv_kernel_time);
 #endif
+    printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
     time_spmv_sum += time_spmv_kernel_time;
 }
 __global__ void bsr_spmv_balanced_tc_fp32(int *rowPtrbyWarp, int *rowIdxbyWarp, int warp_num,
@@ -1872,14 +1877,14 @@ void spmv_amgT_fp16(HYPRE_Int trans,
     gettimeofday1(&t1, NULL);
 #ifdef ADAPTIVE_AMGT_SPMV
     // printf("half!!!!!\n");
-    if (stand >= 12 && avgnz >= 10)
+    if (stand >= 12 && avgnz >= AVGNZCUTOFF)
     {
         // ===tensor core, balanced===
         bsr_spmv_balanced_tc_fp16<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal_fp16, bsrmat->dVecX_fp16, bsrmat->dVecY_fp16, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-    else if (stand >= 12 && avgnz < 10)
+    else if (stand >= 12 && avgnz < AVGNZCUTOFF)
     {
         // ===cuda core, balanced===
         bsr_spmv_balanced_cc_fp16<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal_fp16, bsrmat->dVecX_fp16, bsrmat->dVecY_fp16, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
@@ -1979,21 +1984,21 @@ void spmv_amgT_fp32(HYPRE_Int trans,
     }
     gettimeofday1(&t1, NULL);
 #ifdef ADAPTIVE_AMGT_SPMV
-    if (stand >= 12 && avgnz >= 10)
+    if (stand >= 12 && avgnz >= AVGNZCUTOFF)
     {
         // ===tensor core, balanced===
         bsr_spmv_balanced_tc_fp32<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal_fp32, bsrmat->dVecX_fp32, bsrmat->dVecY_fp32, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-    else if (stand >= 12 && avgnz < 10)
+    else if (stand >= 12 && avgnz < AVGNZCUTOFF)
     {
         // ===cuda core, balanced===
         bsr_spmv_balanced_cc_fp32<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal_fp32, bsrmat->dVecX_fp32, bsrmat->dVecY_fp32, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-    else if (stand < 12 && avgnz >= 10)
+    else if (stand < 12 && avgnz >= AVGNZCUTOFF)
     {
         // ===tensor core===
         bsr_spmv_tc_fp32<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal_fp32, bsrmat->dVecX_fp32, bsrmat->dVecY_fp32, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);

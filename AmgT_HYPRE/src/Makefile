@@ -191,6 +191,8 @@ checkpar:
 install: all
 	@ \
 	echo "Installing hypre ..."; \
+	echo "Hypre lib install: ${HYPRE_LIB_INSTALL}"; \
+	echo "Hypre inc install: ${HYPRE_INC_INSTALL}"; \
 	${HYPRE_SRC_TOP_DIR}/config/mkinstalldirs ${HYPRE_LIB_INSTALL} ${HYPRE_INC_INSTALL}; \
 	HYPRE_PWD=`pwd`; \
 	cd ${HYPRE_BUILD_DIR}/lib; HYPRE_FROMDIR=`pwd`; \

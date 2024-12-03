@@ -1,5 +1,5 @@
 #The config info
-export CUDA_HOME=/usr/local/cuda-12.0
+# export CUDA_HOME=/usr/local/cuda-12.0
 export GPU=A100
 pwd_file=$(pwd)
 chmod -R *
@@ -27,7 +27,7 @@ execuative=cuSPARSE
 cp ${pwd_file}/config_files/${execuative}.h ${HYPRE_HOME}/seq_mv/seq_mv.h
 echo ${pwd_file}/config_files/${execuative}.h
 cd ${HYPRE_HOME}
-make install -j
+make install -j 1
 
 #compile the test file
 cd ${pwd_file}/AmgT_test

@@ -3,7 +3,8 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
-
+#include "cuda_runtime.h"
+#include <nvtx3/nvToolsExt.h>
 #include "sub_files/mmio_highlevel.h"
 #include "sub_files/my_solver.h"
 #include "sub_files/subfunction.h"
@@ -39,6 +40,7 @@ int main(int argc, char **argv)
 {
     cudaSetDevice(0);
     int m, n, nnzA, isSymmetricA;
+    int num_time_iters = 10; //Default
     int *row_ptr; // the csr row pointer array of matrix A
     int *col_idx; // the csr column index array of matrix A
     double *val;  // the csr value array of matrix A
@@ -51,13 +53,16 @@ int main(int argc, char **argv)
     char *lastSlash = strrchr(filename_matrix, '/');
     char *lastDot = strrchr(filename_matrix, '.');
 
+    num_time_iters = atoi(argv[2]);
+    printf("Num timing iters: %d\n", num_time_iters);
+
     if (lastSlash != NULL && lastDot != NULL && lastSlash < lastDot)
     {
         // 计算截取的字符串长度
         size_t length = lastDot - (lastSlash + 1);
 
     }
-    
+
     char *filename_x = NULL; // the filename of solution vector x
 
     double *bval;
@@ -114,10 +119,11 @@ int main(int argc, char **argv)
         mmio_allinone(&m, &n, &nnzA, &isSymmetricA, &row_ptr, &col_idx, &val, filename_matrix);
         if (m != n)
         {
-            printf("Invalid matrix size.\n");
+            printf("Invalid matrix size. %d, %d\n", m, n);
             return 1;
             // phgError(1, "Invalid matrix size.\n");
         }
+        printf("Done reading file.\n");
 
         pack_data.isSymmetricA = isSymmetricA;
         pack_data.m = m;
@@ -161,6 +167,10 @@ int main(int argc, char **argv)
     load_b(n, bval, filename_b);
     MPI_Bcast(bval, m, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 #endif
+    if (myid == 0)
+    {
+        printf("Done broadcasting.\n");
+    }
     /* Preliminaries: want at least one processor per row */
     N = m; /* global number of rows */
     // printf("myrank = %d, N = %d\n", myid, N);
@@ -186,18 +196,30 @@ int main(int argc, char **argv)
     /* Create the matrix.
       Note that this is a square matrix, so we indicate the row partition
       size twice (since number of rows = number of cols) */
+    if (myid == 0)
+    {
+        printf("Creating HYPRE Matrix...\n");
+    }
     HYPRE_IJMatrixCreate(MPI_COMM_WORLD, ilower, iupper, ilower, iupper, &A);
 
     /* Choose a parallel csr format storage (see the User's Manual) */
     HYPRE_IJMatrixSetObjectType(A, HYPRE_PARCSR);
 
     /* Initialize before setting coefficients */
+    if (myid == 0)
+    {
+        printf("Initializing HYPRE Matrix...\n");
+    }
     HYPRE_IJMatrixInitialize(A);
 
     /*
     Note that here we are setting one row at a time, though
       one could set all the rows together (see the User's Manual).
    */
+    if (myid == 0)
+    {
+        printf("Allocating data...\n");
+    }
     cpu_row_ptr = (int *)gpu_malloc(sizeof(int) * m);
     cpu_col_idx = (int *)gpu_malloc(sizeof(int) * nnzA);
     cpu_val = (double *)gpu_malloc(sizeof(double) * nnzA);
@@ -205,10 +227,18 @@ int main(int argc, char **argv)
     cudaMemcpy(cpu_row_ptr, row_ptr, m * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(cpu_col_idx, col_idx, nnzA * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(cpu_val, val, nnzA * sizeof(double), cudaMemcpyHostToDevice);
+    if (myid == 0)
+    {
+        printf("Done memcopying of allocated arrays.\n");
+    }
     {
         int _head;
+
+
         for (i = ilower; i <= iupper; i++)
         {
+            if(i % 100 == 0 && myid == 0)
+                printf("Setting matrix values: %d/%d\n", i, iupper);
             /* Set the values for row i */
             _head = row_ptr[i];
             int len = row_ptr[i + 1] - row_ptr[i];
@@ -218,22 +248,28 @@ int main(int argc, char **argv)
             // HYPRE_IJMatrixSetValues(A, 1, &len, &row, &col_idx[_head], &val[_head]);
             HYPRE_IJMatrixSetValues(A, 1, &tmp[0], &tmp[1], &cpu_col_idx[_head], &cpu_val[_head]);
         }
-        free(val);
-        free(row_ptr);
-        free(col_idx);
-        cudaFree(cpu_val);
-        cudaFree(cpu_row_ptr);
-        cudaFree(cpu_col_idx);
+        // free(val);
+        // free(row_ptr);
+        // free(col_idx);
+        // cudaFree(cpu_val);
+        // cudaFree(cpu_row_ptr);
+        // cudaFree(cpu_col_idx);
     }
 
     /* Assemble after setting the coefficients */
     printf("begin assemble A\n");
     HYPRE_IJMatrixAssemble(A);
     printf("assemble A finish\n");
+
+    // printf("assemble A finish\n");
+    // const char *out_matrix_filename = "mat_out";
+    // HYPRE_IJMatrixPrint(A, out_matrix_filename);
+    // printf("assemble A finish\n");
+
     // phgPrintf("  Convert CSR to hypreA time: ");
     // elapsed_time(TRUE, 0.);
 #else
-    elapsed_time(FALSE, 0.);
+    // elapsed_time(FALSE, 0.);
     if (myid == 0)
     {
         mmio_read_crd_size(&m, &n, &nnzA, filename_matrix);
@@ -277,8 +313,8 @@ int main(int argc, char **argv)
     /* How many rows do I have? */
     local_size = iupper - ilower + 1;
     HYPRE_IJMatrixRead("IJ.out.A", MPI_COMM_WORLD, HYPRE_PARCSR, &A);
-    phgPrintf("  Read files to hypreA time: ");
-    elapsed_time(TRUE, 0.);
+    // phgPrintf("  Read files to hypreA time: ");
+    // elapsed_time(TRUE, 0.);
 #endif
     /* Note: for the testing of small problems, one may wish to read
       in a matrix in IJ format (for the format, see the output files
@@ -321,14 +357,16 @@ int main(int argc, char **argv)
             rows[i] = ilower + i;
         }
 
+        printf("Setting b values too...\n");
         HYPRE_IJVectorSetValues(b, local_size, rows, rhs_values);
         HYPRE_IJVectorSetValues(x, local_size, rows, x_values);
 
-        cudaFree(x_values);
-        cudaFree(rhs_values);
-        cudaFree(rows);
-        cudaFree(bval);
+        // cudaFree(x_values);
+        // cudaFree(rhs_values);
+        // cudaFree(rows);
+        // cudaFree(bval);
     }
+
 
     HYPRE_IJVectorAssemble(b);
 #else
@@ -353,8 +391,8 @@ int main(int argc, char **argv)
 
         HYPRE_IJVectorSetValues(x, local_size, rows, x_values);
 
-        free(x_values);
-        free(rows);
+        // free(x_values);
+        // free(rows);
     }
     HYPRE_IJVectorRead("IJ.out.b", MPI_COMM_WORLD, HYPRE_PARCSR, &b);
 #endif
@@ -421,6 +459,25 @@ int main(int argc, char **argv)
         HYPRE_BoomerAMGSolve(precond, parcsr_A, par_b, par_x);
         gettimeofday(&t2, NULL);
 
+        double solve_time, total_solve_time;
+        total_solve_time = 0.0;
+
+        const char* nvtx_range_name = "AMGSolve_Loop";
+        nvtxRangeId_t r1 = nvtxRangeStartA(nvtx_range_name);
+        for(int time_iter=0; time_iter<num_time_iters; time_iter++){
+
+            gettimeofday(&t1, NULL);
+            HYPRE_BoomerAMGSolve(precond, parcsr_A, par_b, par_x);
+            gettimeofday(&t2, NULL);
+            solve_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+            total_solve_time += solve_time;
+            printf("solve_time=%.5lf\n", solve_time);
+
+        }
+        nvtxRangeEnd(r1);
+        // nvtxRangePop();
+
+
         /* Run info - needed logging turned on */
         HYPRE_BoomerAMGGetNumIterations(precond, &num_iterations);
         HYPRE_BoomerAMGGetFinalRelativeResidualNorm(precond, &final_res_norm);
@@ -431,7 +488,7 @@ int main(int argc, char **argv)
             printf("Iterations = %d\n", num_iterations);
             printf("Final Relative Residual Norm = %e\n", final_res_norm);
             double setup_time = (t_stop.tv_sec - t_start.tv_sec) * 1000.0 + (t_stop.tv_usec - t_start.tv_usec) / 1000.0;
-            double solve_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+            solve_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
             printf("setup_time=%.5lf\n", setup_time);
             printf("solve_time=%.5lf\n", solve_time);
             printf("time_spmv_sum=%.5lf\n", time_spmv_sum);
@@ -440,7 +497,7 @@ int main(int argc, char **argv)
             printf("spmv_times=%d\n", spmv_times);
             printf("time_spgemm=%.5lf\n", time_spgemm);
             printf("time_spgemm_preprocess=%.5lf\n", time_spgemm_preprocess);
-            printf("cusparse_spgemm_time=%.5lf\n", cusparse_spgemm_time);
+            // printf("cusparse_spgemm_time=%.5lf\n", cusparse_spgemm_time);
             printf("spgemm_times=%d\n", spgemm_times);
             printf("time_spgemm_all=%.5lf\n", time_spgemm_all);
 
@@ -450,6 +507,8 @@ int main(int argc, char **argv)
             printf("bsr2csr_step1=%.5lf\n", bsr2csr_step1);
             printf("bsr2csr_step2=%.5lf\n", bsr2csr_step2);
             printf("bsr2csr_step3=%.5lf\n", bsr2csr_step3);
+
+            printf("Average Solve Time: %f  (N=%d)\n", total_solve_time / num_time_iters, num_time_iters);
             printf("\n");
         }
 

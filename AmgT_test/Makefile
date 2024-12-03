@@ -3,6 +3,12 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+
+# mpicc -o test_new test_new.o -g -Wall -DHYPRE_EXAMPLE_USING_CUDA -DH_TIME -L/u/mhawki
+# ns/iter_methods_proj_amgT/AmgT/AmgT_HYPRE/src/local_install/lib -lHYPRE -lm -L/sw/spack/deltas11-2023-03/apps/linux
+# -rhel8-zen3/nvhpc-24.1/cuda-12.3.0-ser66n7/lib64 -lcudart -lcublas -lcusparse -lcurand -lstdc++  -lstdc++
+
+
 ########################################################################
 # Compiler and external dependences
 ########################################################################
@@ -21,6 +27,8 @@ F90       = mpifort
    NVCC_LDFLAGS = -ccbin=${CXX} ${CUDA_ARCH}
    COPTS_CUDA = -DHYPRE_EXAMPLE_USING_CUDA -DH_TIME
    FOPTS_CUDA = -DHYPRE_EXAMPLE_USING_CUDA -qsuppress=cmpmsg
+#    HYPRE_DIR = /u/mhawkins/iter_methods_proj_amgT/AmgT/AmgT_HYPRE/src/hypre
+   echo "HYPRE_DIR: ${HYPRE_DIR}"
 
 
 
@@ -30,7 +38,7 @@ F90       = mpifort
 COPTS     = -g -Wall $(COPTS_CUDA)
 CINCLUDES = -I$(HYPRE_DIR)/include $(CUDA_INCL)
 #CDEFS     = -DHYPRE_EXVIS
-CDEFS     = 
+CDEFS     =
 CFLAGS    = $(COPTS) $(CINCLUDES) $(CDEFS)
 FOPTS     = -g $(FOPTS_CUDA)
 FINCLUDES = $(CINCLUDES)
@@ -38,9 +46,9 @@ FFLAGS    = $(FOPTS) $(FINCLUDES)
 CXXOPTS   = $(COPTS) -Wno-deprecated
 CXXINCLUDES = $(CINCLUDES) -I..
 CXXDEFS   = $(CDEFS)
-IFLAGS_BXX = 
+IFLAGS_BXX =
 CXXFLAGS  = $(CXXOPTS) $(CXXINCLUDES) $(CXXDEFS) $(IFLAGS_BXX)
-IF90FLAGS = 
+IF90FLAGS =
 F90FLAGS = $(FFLAGS) $(IF90FLAGS)
 
 
