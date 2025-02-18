@@ -14,6 +14,7 @@
 #include "seq_mv.h"
 #include "_hypre_utilities.hpp"
 #include "seq_mv.hpp"
+#include <nvtx3/nvToolsExt.h>
 
 double AVGNZCUTOFF =  0.0; // The avgnz cutoff between using TCs or Cuda cores per block
 
@@ -1297,6 +1298,7 @@ void BSR_BALANCED_PREPROCESS_GPU(hypre_CSRMatrix *A)
         cudaDeviceSynchronize();
     }
 }
+
 void spmv_amgT_fp64(HYPRE_Int trans,
                     HYPRE_Complex alpha,
                     hypre_CSRMatrix *A,
@@ -1327,43 +1329,76 @@ void spmv_amgT_fp64(HYPRE_Int trans,
     double stand = bsrmat->stand;
     double avgnz = bsrmat->avg_nnz;
 
-    printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
+    // printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
 
-#ifdef ADAPTIVE_AMGT_SPMV
-    if (stand >= 12 && avgnz >= AVGNZCUTOFF)
-    {
+#ifdef TC_AMGT_SPMV
+    printf("Using tensor cores\n");
+    if (stand >= 12)
+        {
         // ===tensor core, balanced===
         bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
-    }
-    else if (stand >= 12 && avgnz < AVGNZCUTOFF)
-    {
-        // ===cuda core, balanced===
-        bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
-        cudaDeviceSynchronize();
-        // ===============================
-    }
-    else if (stand < 12 && avgnz >= AVGNZCUTOFF)
+        }
+    else
     {
         // ===tensor core===
         bsr_spmv_tc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-    else
+#else // Use Cuda Cores
+    printf("Using CUDA cores\n");
+    if (stand >= 12)
+    {
+        // ===cuda core, balanced===
+        bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+        cudaDeviceSynchronize();
+        // ===============================
+    }else
     {
         // ===cuda core===
         bsr_spmv_cc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
         cudaDeviceSynchronize();
         // ===============================
     }
-
-#else
-
-    bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
-    cudaDeviceSynchronize();
 #endif
+
+// #ifdef ADAPTIVE_AMGT_SPMV
+//     if (stand >= 12 && avgnz >= AVGNZCUTOFF)
+//     {
+//         // ===tensor core, balanced===
+//         bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }
+//     else if (stand >= 12 && avgnz < AVGNZCUTOFF)
+//     {
+//         // ===cuda core, balanced===
+//         bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }
+//     else if (stand < 12 && avgnz >= AVGNZCUTOFF)
+//     {
+//         // ===tensor core===
+//         bsr_spmv_tc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }
+//     else
+//     {
+//         // ===cuda core===
+//         bsr_spmv_cc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }
+
+// #else
+
+//     bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//     cudaDeviceSynchronize();
+// #endif
     gettimeofday1(&t2, NULL);
     double time_spmv_kernel_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
 #ifdef PRINT_KERNEL_PERFORMANCE
@@ -1374,6 +1409,248 @@ void spmv_amgT_fp64(HYPRE_Int trans,
     printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
     time_spmv_sum += time_spmv_kernel_time;
 }
+
+// Register NVTX strings for performance profiling
+nvtxStringHandle_t spmv_cc_string        = nvtxDomainRegisterStringA(NULL, "spmv_amgT_fp64_CC");
+nvtxStringHandle_t spmv_tc_string        = nvtxDomainRegisterStringA(NULL, "spmv_amgT_fp64_TC");
+
+nvtxStringHandle_t spmv_cc_kernel_string = nvtxDomainRegisterStringA(NULL, "spmv_amgT_fp64_CC_kernel");
+nvtxStringHandle_t spmv_tc_kernel_string = nvtxDomainRegisterStringA(NULL, "spmv_amgT_fp64_TC_kernel");
+
+nvtxStringHandle_t bsr_string            = nvtxDomainRegisterStringA(NULL, "CSR2BSR");
+nvtxStringHandle_t bsr_balanced_string   = nvtxDomainRegisterStringA(NULL, "BSR_BALANCED_PREPROCESS_GPU");
+nvtxStringHandle_t spmv_prepare_string   = nvtxDomainRegisterStringA(NULL, "spmv_prepare");
+
+void spmv_amgT_fp64_CC(HYPRE_Int trans,
+                    HYPRE_Complex alpha,
+                    hypre_CSRMatrix *A,
+                    hypre_Vector *x,
+                    HYPRE_Complex beta,
+                    hypre_Vector *y,
+                    HYPRE_Int offset)
+{
+    nvtxRangePushA("spmv_amgT_fp64_CC");
+    // struct timeval t1, t2;
+    // gettimeofday1(&t1, NULL);
+    nvtxRangePushA("CSR2BSR");
+    CSR2BSR_GPU(A);
+    nvtxRangePop();
+
+    nvtxRangePushA("BSR_BALANCED_PREPROCESS_GPU");
+    BSR_BALANCED_PREPROCESS_GPU(A);
+    nvtxRangePop();
+    // gettimeofday1(&t2, NULL);
+    // time_spmv_preprocess += (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+    // gettimeofday1(&t1, NULL);
+    nvtxRangePushA("spmv_prepare");
+    bsrMAT *bsrmat = (hypre_BSR(A));
+    MAT_VAL_TYPE *dvecX = hypre_VectorData(x);
+    MAT_VAL_TYPE *dvecY = hypre_VectorData(y);
+    int ThreadNum = WARP_SIZE * WARP_NUM_SPMV;
+    int BlockNum_b = (bsrmat->warpnum + WARP_NUM_SPMV - 1) / WARP_NUM_SPMV;
+    int BlockNum = (bsrmat->blc_row + WARP_NUM_SPMV - 1) / WARP_NUM_SPMV;
+    int BlockNum2 = (bsrmat->row + ThreadNum - 1) / ThreadNum;
+    if (beta != 1)
+    {
+        beta_vecY<<<BlockNum2, ThreadNum>>>(dvecY, beta, bsrmat->row);
+        cudaDeviceSynchronize();
+    }
+    double stand = bsrmat->stand;
+    double avgnz = bsrmat->avg_nnz;
+    nvtxRangePop();
+
+    // printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
+
+    // Use Cuda Cores
+    // printf("Using CUDA cores\n");
+    nvtxRangePushA("spmv_amgT_fp64_CC_kernel");
+    if (stand >= 12)
+    {
+        // ===cuda core, balanced===
+        bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+        cudaDeviceSynchronize();
+        // ===============================
+    }else
+    {
+        // ===cuda core===
+        bsr_spmv_cc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+        cudaDeviceSynchronize();
+        // ===============================
+    }
+    nvtxRangePop();
+    nvtxRangePop();
+}
+
+void spmv_amgT_fp64_TC(HYPRE_Int trans,
+                    HYPRE_Complex alpha,
+                    hypre_CSRMatrix *A,
+                    hypre_Vector *x,
+                    HYPRE_Complex beta,
+                    hypre_Vector *y,
+                    HYPRE_Int offset)
+{
+    nvtxRangePushA("spmv_amgT_fp64_TC");
+    // struct timeval t1, t2;
+    // gettimeofday1(&t1, NULL);
+    nvtxRangePushA("CSR2BSR");
+    CSR2BSR_GPU(A);
+    nvtxRangePop();
+
+    nvtxRangePushA("BSR_BALANCED_PREPROCESS_GPU");
+    BSR_BALANCED_PREPROCESS_GPU(A);
+    nvtxRangePop();
+    // gettimeofday1(&t2, NULL);
+    // time_spmv_preprocess += (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+    // gettimeofday1(&t1, NULL);
+    nvtxRangePushA("spmv_prepare");
+    bsrMAT *bsrmat = (hypre_BSR(A));
+    MAT_VAL_TYPE *dvecX = hypre_VectorData(x);
+    MAT_VAL_TYPE *dvecY = hypre_VectorData(y);
+    int ThreadNum = WARP_SIZE * WARP_NUM_SPMV;
+    int BlockNum_b = (bsrmat->warpnum + WARP_NUM_SPMV - 1) / WARP_NUM_SPMV;
+    int BlockNum = (bsrmat->blc_row + WARP_NUM_SPMV - 1) / WARP_NUM_SPMV;
+    int BlockNum2 = (bsrmat->row + ThreadNum - 1) / ThreadNum;
+    if (beta != 1)
+    {
+        beta_vecY<<<BlockNum2, ThreadNum>>>(dvecY, beta, bsrmat->row);
+        cudaDeviceSynchronize();
+    }
+    double stand = bsrmat->stand;
+    double avgnz = bsrmat->avg_nnz;
+    nvtxRangePop();
+    // printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
+
+    // Tensor Cores
+    // printf("Using tensor cores\n");
+    nvtxRangePushA("spmv_amgT_fp64_TC_kernel");
+    if (stand >= 12)
+        {
+        // ===tensor core, balanced===
+        bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+        cudaDeviceSynchronize();
+        // ===============================
+        }
+    else
+    {
+        // ===tensor core===
+        bsr_spmv_tc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+        cudaDeviceSynchronize();
+        // ===============================
+    }
+    nvtxRangePop();
+    nvtxRangePop();
+}
+// Original but still edited
+// void spmv_amgT_fp64(HYPRE_Int trans,
+//                     HYPRE_Complex alpha,
+//                     hypre_CSRMatrix *A,
+//                     hypre_Vector *x,
+//                     HYPRE_Complex beta,
+//                     hypre_Vector *y,
+//                     HYPRE_Int offset)
+// {
+//     struct timeval t1, t2;
+//     gettimeofday1(&t1, NULL);
+//     CSR2BSR_GPU(A);
+//     BSR_BALANCED_PREPROCESS_GPU(A);
+//     gettimeofday1(&t2, NULL);
+//     time_spmv_preprocess += (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+//     gettimeofday1(&t1, NULL);
+//     bsrMAT *bsrmat = (hypre_BSR(A));
+//     MAT_VAL_TYPE *dvecX = hypre_VectorData(x);
+//     MAT_VAL_TYPE *dvecY = hypre_VectorData(y);
+//     int ThreadNum = WARP_SIZE * WARP_NUM_SPMV;
+//     int BlockNum_b = (bsrmat->warpnum + WARP_NUM_SPMV - 1) / WARP_NUM_SPMV;
+//     int BlockNum = (bsrmat->blc_row + WARP_NUM_SPMV - 1) / WARP_NUM_SPMV;
+//     int BlockNum2 = (bsrmat->row + ThreadNum - 1) / ThreadNum;
+//     if (beta != 1)
+//     {
+//         beta_vecY<<<BlockNum2, ThreadNum>>>(dvecY, beta, bsrmat->row);
+//         cudaDeviceSynchronize();
+//     }
+//     double stand = bsrmat->stand;
+//     double avgnz = bsrmat->avg_nnz;
+
+//     // printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
+
+// #ifdef TC_AMGT_SPMV
+//     printf("Using tensor cores\n");
+//     if (stand >= 12)
+//         {
+//         // ===tensor core, balanced===
+//         bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//         }
+//     else
+//     {
+//         // ===tensor core===
+//         bsr_spmv_tc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }
+// #else // Use Cuda Cores
+//     printf("Using CUDA cores\n");
+//     if (stand >= 12)
+//     {
+//         // ===cuda core, balanced===
+//         bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }else
+//     {
+//         // ===cuda core===
+//         bsr_spmv_cc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+//         cudaDeviceSynchronize();
+//         // ===============================
+//     }
+// #endif
+
+// // #ifdef ADAPTIVE_AMGT_SPMV
+// //     if (stand >= 12 && avgnz >= AVGNZCUTOFF)
+// //     {
+// //         // ===tensor core, balanced===
+// //         bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+// //         cudaDeviceSynchronize();
+// //         // ===============================
+// //     }
+// //     else if (stand >= 12 && avgnz < AVGNZCUTOFF)
+// //     {
+// //         // ===cuda core, balanced===
+// //         bsr_spmv_balanced_cc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+// //         cudaDeviceSynchronize();
+// //         // ===============================
+// //     }
+// //     else if (stand < 12 && avgnz >= AVGNZCUTOFF)
+// //     {
+// //         // ===tensor core===
+// //         bsr_spmv_tc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+// //         cudaDeviceSynchronize();
+// //         // ===============================
+// //     }
+// //     else
+// //     {
+// //         // ===cuda core===
+// //         bsr_spmv_cc_fp64<<<BlockNum, ThreadNum>>>(bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcMap, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+// //         cudaDeviceSynchronize();
+// //         // ===============================
+// //     }
+
+// // #else
+
+// //     bsr_spmv_balanced_tc_fp64<<<BlockNum_b, ThreadNum>>>(bsrmat->rowPtrbyWarp, bsrmat->rowIdxbyWarp, bsrmat->warpnum, bsrmat->blcPtr, bsrmat->blcIdx, bsrmat->blcVal, dvecX, dvecY, bsrmat->blc_row, bsrmat->blc_col, bsrmat->row, bsrmat->col, alpha);
+// //     cudaDeviceSynchronize();
+// // #endif
+//     gettimeofday1(&t2, NULL);
+//     double time_spmv_kernel_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+// #ifdef PRINT_KERNEL_PERFORMANCE
+//     printf("spmv_kernel_m=%d\n", bsrmat->row);
+//     printf("spmv_kernel_n=%d\n", bsrmat->col);
+//     printf("spmv_kernel_time=%lf\n", time_spmv_kernel_time);
+// #endif
+//     printf("In csr_matvec_device. avgnz: %f  AVGNZCUTOFF: %f\n", avgnz, AVGNZCUTOFF);
+//     time_spmv_sum += time_spmv_kernel_time;
+// }
 __global__ void bsr_spmv_balanced_tc_fp32(int *rowPtrbyWarp, int *rowIdxbyWarp, int warp_num,
                                           MAT_PTR_TYPE *d_blcPtr, MAT_IDX_TYPE *d_blcCid, float *d_blcVal,
                                           float *d_x, float *d_y, int blc_row, int blc_col, int row, int col,
@@ -2031,6 +2308,92 @@ void spmv_amgT_fp32(HYPRE_Int trans,
     time_spmv_sum += time_spmv_kernel_time;
 }
 
+
+HYPRE_Int
+hypre_CSRMatrixMatvecCusparseNewAPI_Cusparse(HYPRE_Int trans,
+                                    HYPRE_Complex alpha,
+                                    hypre_CSRMatrix *A,
+                                    hypre_Vector *x,
+                                    HYPRE_Complex beta,
+                                    hypre_Vector *y,
+                                    HYPRE_Int offset)
+{
+
+    nvtxRangePushA("spmv_amgT_fp64_cusparse");
+
+    nvtxRangePushA("spmv_cusparse_prepare");
+
+    HYPRE_Int num_vectors = 1;
+    HYPRE_Int num_cols = trans ? hypre_CSRMatrixNumRows(A) : hypre_CSRMatrixNumCols(A);
+    HYPRE_Int num_rows = trans ? hypre_CSRMatrixNumCols(A) : hypre_CSRMatrixNumRows(A);
+    hypre_CSRMatrix *B;
+    /* SpMV data */
+    size_t bufferSize = 0;
+    char *dBuffer = hypre_CSRMatrixGPUMatSpMVBuffer(A);
+    cusparseHandle_t handle = hypre_HandleCusparseHandle(hypre_handle());
+    const cudaDataType data_type = hypre_HYPREComplexToCudaDataType();
+    const cusparseIndexType_t index_type = hypre_HYPREIntToCusparseIndexType();
+
+    /* Local cusparse descriptor variables */
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+    cusparseDnMatDescr_t matX, matY;
+
+    B = A;
+
+    /* Create cuSPARSE vector data structures */
+    matA = hypre_CSRMatrixToCusparseSpMat(B, offset);
+
+    vecX = hypre_VectorToCusparseDnVec(x, 0, num_cols);
+    vecY = hypre_VectorToCusparseDnVec(y, offset, num_rows - offset);
+
+    if (!dBuffer)
+    {
+        HYPRE_CUSPARSE_CALL(cusparseSpMV_bufferSize(handle,
+                                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                                    &alpha,
+                                                    matA,
+                                                    vecX,
+                                                    &beta,
+                                                    vecY,
+                                                    data_type,
+                                                    HYPRE_CUSPARSE_SPMV_ALG,
+                                                    &bufferSize));
+
+
+        dBuffer = hypre_TAlloc(char, bufferSize, HYPRE_MEMORY_DEVICE);
+        hypre_CSRMatrixGPUMatSpMVBuffer(A) = dBuffer;
+    }
+
+    nvtxRangePop();
+    nvtxRangePushA("spmv_cusparse_kernel");
+
+
+    HYPRE_CUSPARSE_CALL(cusparseSpMV(handle,
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &alpha,
+                                        matA,
+                                        vecX,
+                                        &beta,
+                                        vecY,
+                                        data_type,
+                                        HYPRE_CUSPARSE_SPMV_ALG,
+                                        dBuffer));
+
+    hypre_SyncComputeStream(hypre_handle());
+    nvtxRangePop();
+
+    /* Free memory */
+    HYPRE_CUSPARSE_CALL(cusparseDestroySpMat(matA));
+
+    HYPRE_CUSPARSE_CALL(cusparseDestroyDnVec(vecX));
+    HYPRE_CUSPARSE_CALL(cusparseDestroyDnVec(vecY));
+
+#endif
+    nvtxRangePop();
+    return hypre_error_flag;
+}
+
 HYPRE_Int
 hypre_CSRMatrixMatvecCusparseNewAPI(HYPRE_Int trans,
                                     HYPRE_Complex alpha,
@@ -2414,4 +2777,4 @@ hypre_CSRMatrixMatvecOnemklsparse(HYPRE_Int trans,
 }
 #endif // #if defined(HYPRE_USING_ROCSPARSE)
 
-#endif // #if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)
+// #endif // #if defined(HYPRE_USING_GPU) || defined(HYPRE_USING_DEVICE_OPENMP)

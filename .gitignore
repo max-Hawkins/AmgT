@@ -1,0 +1,8 @@
+data/
+nsys_reports/
+plot_venv/
+test_data/
+report_data/
+runnable_files/
+*.nsys-rep
+*.sqlite

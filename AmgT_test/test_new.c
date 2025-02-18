@@ -3,11 +3,12 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
-#include "cuda_runtime.h"
-#include <nvtx3/nvToolsExt.h>
+#include <unistd.h>
 #include "sub_files/mmio_highlevel.h"
 #include "sub_files/my_solver.h"
 #include "sub_files/subfunction.h"
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "HYPRE_krylov.h"
 #include "HYPRE.h"
@@ -16,6 +17,43 @@
 #include "seq_mv.h"
 #include "ex.h"
 #include "_hypre_parcsr_ls.h"
+// #include "_hypre_utilities.hpp"
+// #include "seq_mv/seq_mv.hpp"
+
+
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include "nvml.h"
+#include "nvmlClass.h"
+#include <nvtx3/nvToolsExt.h>
+
+#define HYPRE_CUSPARSE_SPMV_ALG CUSPARSE_SPMV_ALG_DEFAULT
+// #define HYPRE_USING_CUSPARSE
+
+
+// *************** FOR ERROR CHECKING *******************
+#ifndef CUDA_RT_CALL
+#define CUDA_RT_CALL( call )                                                                                           \
+    {                                                                                                                  \
+        auto status = static_cast<cudaError_t>( call );                                                                \
+        if ( status != cudaSuccess )                                                                                   \
+            fprintf( stderr,                                                                                           \
+                     "ERROR: CUDA RT call \"%s\" in line %d of file %s failed "                                        \
+                     "with "                                                                                           \
+                     "%s (%d).\n",                                                                                     \
+                     #call,                                                                                            \
+                     __LINE__,                                                                                         \
+                     __FILE__,                                                                                         \
+                     cudaGetErrorString( status ),                                                                     \
+                     status );                                                                                         \
+    }
+#endif  // CUDA_RT_CALL
+
+#define CHECK_NVML(result, message) \
+    if (result != NVML_SUCCESS) { \
+        printf("%s : %s", message, nvmlErrorString(result)); \
+        return 1; \
+    }
 
 #ifdef HYPRE_EXVIS
 #include "vis.c"
@@ -36,65 +74,117 @@ typedef struct _temp_data
 #define ReadMMFile 1
 #define ReadHypreFile 0
 
+void cublas_calculate(){
+    cublasHandle_t handle;
+
+    /* Initialize CUBLAS */
+    CUDA_RT_CALL( cublasCreate( &handle ) );
+}
+
 int main(int argc, char **argv)
 {
     cudaSetDevice(0);
     int m, n, nnzA, isSymmetricA;
-    int num_time_iters = 10; //Default
     int *row_ptr; // the csr row pointer array of matrix A
     int *col_idx; // the csr column index array of matrix A
-    double *val;  // the csr value array of matrix A
     int *cpu_row_ptr;
     int *cpu_col_idx;
     double *cpu_val;
     double *cpu_bval;
 
+    long num_trials = 1000;
+    char *kernel_type = "TC"; // Default to tensor cores
+    int kernel_type_int = -1;
+
+    if (argc >= 4) {
+        num_trials = atoi(argv[2]);
+        kernel_type = argv[3];
+        if (strcmp(kernel_type, "TC") == 0){
+            kernel_type_int = 0;
+        }else if(strcmp(kernel_type, "CC") == 0){
+            kernel_type_int = 1;
+        }else if(strcmp(kernel_type, "cusparse") == 0){
+            kernel_type_int = 2;
+        }else{
+            printf("Error: Kernel type must be either TC or CC or cusparse\n");
+            return 1;
+        }
+    }else{
+        printf("Error. Must pass in Number of trials and kernel type\n");
+        printf("Usage: ./test_new <matrix_file> <num_trials> <kernel_type>\n");
+        printf("\tkernel_type: TC (tensor cores), CC (CUDA cores), or cusparse\n");
+        return 1;
+    }
     char *filename_matrix = argv[1];
+    // char *lastSlash = strrchr(filename_matrix, '/');
+    // char *lastDot = strrchr(filename_matrix, '.');
+
+    // if (lastSlash != NULL && lastDot != NULL && lastSlash < lastDot)
+    // {
+    //     // 计算截取的字符串长度
+    //     size_t length = lastDot - (lastSlash + 1);
+    // }
+
+    // Extract matrix name and block sparsity from path
+    char matrix_name[256];
+    char block_sparsity[8];
     char *lastSlash = strrchr(filename_matrix, '/');
     char *lastDot = strrchr(filename_matrix, '.');
+    char *lastUnderscore = strrchr(filename_matrix, '_');
 
-    num_time_iters = atoi(argv[2]);
-    printf("Num timing iters: %d\n", num_time_iters);
-
-    if (lastSlash != NULL && lastDot != NULL && lastSlash < lastDot)
-    {
-        // 计算截取的字符串长度
+    // Extract matrix name
+    if (lastSlash != NULL && lastDot != NULL && lastSlash < lastDot) {
         size_t length = lastDot - (lastSlash + 1);
-
+        strncpy(matrix_name, lastSlash + 1, length);
+        matrix_name[length] = '\0';
+    } else if (lastDot != NULL) {
+        size_t length = lastDot - filename_matrix;
+        strncpy(matrix_name, filename_matrix, length);
+        matrix_name[length] = '\0';
+    } else {
+        strcpy(matrix_name, filename_matrix);
     }
 
-    char *filename_x = NULL; // the filename of solution vector x
+    // Extract block sparsity number (assuming format: *_nnz_X.mtx where X is 1-16)
+    if (lastUnderscore != NULL && lastDot != NULL && lastUnderscore < lastDot) {
+        strncpy(block_sparsity, lastUnderscore + 1, lastDot - lastUnderscore - 1);
+        block_sparsity[lastDot - lastUnderscore - 1] = '\0';
+    } else {
+        strcpy(block_sparsity, "unknown");
+    }
 
-    double *bval;
+    // Create unique directory name with matrix name, kernel type, and block sparsity
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "data/%s_%s", matrix_name, kernel_type);
+
+    // Create directory if it doesn't exist, otherwise overwrite
+    struct stat st = {0};
+    if (stat(dir_path, &st) == -1) {
+        mkdir(dir_path, 0700);
+    }
+
+    printf("Matrix name: %s\n", matrix_name);
+    printf("Block sparsity: %s\n", block_sparsity);
+    printf("Directory path: %s\n", dir_path);
+
+    std::string const nvml_csv_filename = { std::string(dir_path) + "/gpuStats.csv" };
 
     int i;
     int myid, num_procs;
     int N;
-
-    int ilower, iupper;
-    int local_size, extra;
-
-    int solver_id;
-    int vis, print_system, print_system2;
-
-    HYPRE_IJMatrix A;
-    HYPRE_ParCSRMatrix parcsr_A;
-    HYPRE_IJVector b;
-    HYPRE_ParVector par_b;
-    HYPRE_IJVector x;
-    HYPRE_ParVector par_x;
-
-    HYPRE_Solver solver, precond;
 
     /* Initialize MPI */
     MPI_Init(&argc, &argv);
 
     /* Initialize HYPRE */
     HYPRE_Init();
-#if defined(HYPRE_USING_GPU)
     /* use vendor implementation for SpxGEMM */
     HYPRE_SetSpGemmUseVendor(1);
-#endif
+    HYPRE_SetMemoryLocation(HYPRE_MEMORY_DEVICE);
+    /* setup AMG on GPUs */
+    HYPRE_SetExecutionPolicy(HYPRE_EXEC_DEVICE);
+
+
     MPI_Comm comm = MPI_COMM_WORLD;
     MPI_Comm_size(comm, &num_procs);
     MPI_Comm_rank(comm, &myid);
@@ -105,428 +195,403 @@ int main(int argc, char **argv)
     MPI_Type_contiguous(6, MPI_INT, &newtype);
     MPI_Type_commit(&newtype);
 
-    /* Default problem parameters */
-    // n = 33;
-    solver_id = 0;
-    vis = 0;
-    print_system = 0;
-    print_system2 = 0;
-#if ReadMMFile
-    // elapsed_time(FALSE, 0.);
-#if 1
-    if (myid == 0)
-    {
-        mmio_allinone(&m, &n, &nnzA, &isSymmetricA, &row_ptr, &col_idx, &val, filename_matrix);
-        if (m != n)
-        {
-            printf("Invalid matrix size. %d, %d\n", m, n);
-            return 1;
-            // phgError(1, "Invalid matrix size.\n");
+    printf("Num procs: %d\n", num_procs);
+    printf("Num trials: %d\n", num_trials);
+    printf("MatrixFilename: %s\n", filename_matrix);
+
+    unsigned int device_count;
+
+    CHECK_NVML(nvmlInit(), "Failed to initialize NVML");
+    CHECK_NVML(nvmlDeviceGetCount(&device_count), "Failed to get device count");
+
+    int dev {};
+    cudaGetDevice( &dev );
+    CUDA_RT_CALL( cudaSetDevice( dev ) );
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+
+
+    // Create NVML class to retrieve GPU stats
+    nvmlClass nvml(dev, nvml_csv_filename);
+    printf("Preparing for benchmark...\n");
+
+
+    FILE *f;
+    MM_typecode matcode;
+    int ret_code;
+    int num_rows, num_cols, nnz;
+    int *I, *J;
+    double *val;
+
+    // Open the matrix market file
+    f = fopen(filename_matrix, "r");
+    if (f == NULL) {
+        printf("Could not open matrix file\n");
+        return -1;
+    }
+
+    // Read banner and size
+    if (mm_read_banner(f, &matcode) != 0) {
+        printf("Could not process Matrix Market banner\n");
+        return -1;
+    }
+
+    if (mm_read_mtx_crd_size(f, &num_rows, &num_cols, &nnz) != 0) {
+        printf("Could not read matrix size\n");
+        return -1;
+    }
+
+    HYPRE_Int big_init = 0; // Don't do big init
+    HYPRE_MemoryLocation test_A_mem_loc = HYPRE_MEMORY_HOST;
+
+    hypre_CSRMatrix *test_A;
+    test_A = hypre_CSRMatrixCreate(num_rows, num_cols, nnz);
+
+    // Print matrix info for debugging
+    printf("Matrix size: %d x %d with %d nonzeros\n", num_rows, num_cols, nnz);
+    if (nnz <= 0 || num_rows <= 0 || num_cols <= 0) {
+        printf("Invalid matrix dimensions or nonzeros\n");
+        return -1;
+    }
+
+    int *A_i = (int *)malloc((num_rows + 1) * sizeof(int)); // Row offsets?
+    int *A_j = (int *)malloc(nnz * sizeof(int)); // Column indices
+    double *A_data = (double *)malloc(nnz * sizeof(double)); // Non-zero values
+
+    int prev_val_row = 0;
+    int cur_val_row = 0;
+    A_i[0] = 0;
+
+    // Read matrix entries
+    for (i = 0; i < nnz; i++) {
+        if (mm_is_pattern(matcode)) {
+            if (fscanf(f, "%d %d\n", &cur_val_row, &A_j[i]) != 2) {
+                printf("Error reading pattern entry %d\n", i);
+                break;
+            }
+            A_data[i] = 1.0;
+        } else {
+            if (fscanf(f, "%d %d %lg\n", &cur_val_row, &A_j[i], &A_data[i]) != 3) {
+                printf("Error reading value entry %d\n", i);
+                break;
+            }
         }
-        printf("Done reading file.\n");
+        // Adjust for 0-based indexing
+        // cur_val_row--;
+        A_j[i]--;
 
-        pack_data.isSymmetricA = isSymmetricA;
-        pack_data.m = m;
-        pack_data.n = n;
-        pack_data.nnzA = nnzA;
-        MPI_Bcast(&pack_data, 1, newtype, 0, MPI_COMM_WORLD);
-
-        // x = (double *)malloc(sizeof(double) * n);
-        bval = (double *)malloc(sizeof(double) * m);
-
-        // load right-hand side vector b
-        // load_b(n, bval, filename_b);
-        for (int i = 0; i < n; i++)
-            bval[i] = 1.0;
-    }
-    else
-    {
-        MPI_Bcast(&pack_data, 1, newtype, 0, MPI_COMM_WORLD);
-        isSymmetricA = pack_data.isSymmetricA;
-        m = pack_data.m;
-        n = pack_data.n;
-        nnzA = pack_data.nnzA;
-    }
-    if (myid != 0)
-    {
-        row_ptr = (int *)malloc(sizeof(int) * m);
-        col_idx = (int *)malloc(sizeof(int) * nnzA);
-        val = (double *)malloc(sizeof(double) * nnzA);
-        bval = (double *)malloc(sizeof(double) * m);
-    }
-    // MPI_Barrier(MPI_COMM_WORLD); F
-    MPI_Bcast(row_ptr, m + 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(col_idx, nnzA, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(val, nnzA, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Bcast(bval, m, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-#else
-    mmio_allinone(&m, &n, &nnzA, &isSymmetricA, &row_ptr, &col_idx, &val, filename_matrix);
-    bval = (double *)malloc(sizeof(double) * m);
-
-    // load right-hand side vector b
-    load_b(n, bval, filename_b);
-    MPI_Bcast(bval, m, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-#endif
-    if (myid == 0)
-    {
-        printf("Done broadcasting.\n");
-    }
-    /* Preliminaries: want at least one processor per row */
-    N = m; /* global number of rows */
-    // printf("myrank = %d, N = %d\n", myid, N);
-
-    /* Each processor knows only of its own rows - the range is denoted by ilower
-      and upper.  Here we partition the rows. We account for the fact that
-      N may not divide evenly by the number of processors. */
-    local_size = N / num_procs;
-    extra = N - local_size * num_procs;
-
-    // printf("myrank = %d, local_size = %d\n", myid, local_size);
-
-    ilower = local_size * myid;
-    ilower += my_min(myid, extra);
-
-    iupper = local_size * (myid + 1);
-    iupper += my_min(myid + 1, extra);
-    iupper = iupper - 1;
-
-    /* How many rows do I have? */
-    local_size = iupper - ilower + 1;
-
-    /* Create the matrix.
-      Note that this is a square matrix, so we indicate the row partition
-      size twice (since number of rows = number of cols) */
-    if (myid == 0)
-    {
-        printf("Creating HYPRE Matrix...\n");
-    }
-    HYPRE_IJMatrixCreate(MPI_COMM_WORLD, ilower, iupper, ilower, iupper, &A);
-
-    /* Choose a parallel csr format storage (see the User's Manual) */
-    HYPRE_IJMatrixSetObjectType(A, HYPRE_PARCSR);
-
-    /* Initialize before setting coefficients */
-    if (myid == 0)
-    {
-        printf("Initializing HYPRE Matrix...\n");
-    }
-    HYPRE_IJMatrixInitialize(A);
-
-    /*
-    Note that here we are setting one row at a time, though
-      one could set all the rows together (see the User's Manual).
-   */
-    if (myid == 0)
-    {
-        printf("Allocating data...\n");
-    }
-    cpu_row_ptr = (int *)gpu_malloc(sizeof(int) * m);
-    cpu_col_idx = (int *)gpu_malloc(sizeof(int) * nnzA);
-    cpu_val = (double *)gpu_malloc(sizeof(double) * nnzA);
-    int *tmp = (int *)gpu_malloc(2 * sizeof(int));
-    cudaMemcpy(cpu_row_ptr, row_ptr, m * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(cpu_col_idx, col_idx, nnzA * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(cpu_val, val, nnzA * sizeof(double), cudaMemcpyHostToDevice);
-    if (myid == 0)
-    {
-        printf("Done memcopying of allocated arrays.\n");
-    }
-    {
-        int _head;
-
-
-        for (i = ilower; i <= iupper; i++)
-        {
-            if(i % 100 == 0 && myid == 0)
-                printf("Setting matrix values: %d/%d\n", i, iupper);
-            /* Set the values for row i */
-            _head = row_ptr[i];
-            int len = row_ptr[i + 1] - row_ptr[i];
-            int row = i;
-            tmp[0] = len;
-            tmp[1] = i;
-            // HYPRE_IJMatrixSetValues(A, 1, &len, &row, &col_idx[_head], &val[_head]);
-            HYPRE_IJMatrixSetValues(A, 1, &tmp[0], &tmp[1], &cpu_col_idx[_head], &cpu_val[_head]);
+        if (prev_val_row != cur_val_row) {
+            // printf("cur_val_row=%d, i=%d\n", cur_val_row, i);
+            for(int z = prev_val_row; z <= cur_val_row; z++)
+                A_i[z] = i;
         }
-        // free(val);
-        // free(row_ptr);
-        // free(col_idx);
-        // cudaFree(cpu_val);
-        // cudaFree(cpu_row_ptr);
-        // cudaFree(cpu_col_idx);
+        prev_val_row = cur_val_row;
     }
+    // printf("I=%d, A_j[%d]=%d, A_data[%d]=%lg\n", cur_val_row, i, A_j[i], i, A_data[i]);
+    A_i[num_rows] = nnz;
 
-    /* Assemble after setting the coefficients */
-    printf("begin assemble A\n");
-    HYPRE_IJMatrixAssemble(A);
-    printf("assemble A finish\n");
+    fclose(f);
 
-    // printf("assemble A finish\n");
-    // const char *out_matrix_filename = "mat_out";
-    // HYPRE_IJMatrixPrint(A, out_matrix_filename);
-    // printf("assemble A finish\n");
+    // Set Hypre CSR Matrix
+    hypre_CSRMatrixI(test_A) = (HYPRE_Int *)A_i;
+    hypre_CSRMatrixJ(test_A) = (HYPRE_Int *)A_j;
+    hypre_CSRMatrixData(test_A) = (HYPRE_Complex *)A_data;
 
-    // phgPrintf("  Convert CSR to hypreA time: ");
-    // elapsed_time(TRUE, 0.);
-#else
-    // elapsed_time(FALSE, 0.);
-    if (myid == 0)
-    {
-        mmio_read_crd_size(&m, &n, &nnzA, filename_matrix);
-        isSymmetricA = 0;
-        if (m != n)
-        {
-            printf("Invalid matrix size.\n");
-            // phgError(1, "Invalid matrix size.\n");
-        }
+    HYPRE_Int num_nonzeros = hypre_CSRMatrixNumNonzeros(test_A);
+    printf("Num nonzeros: %d\n", num_nonzeros);
 
-        pack_data.isSymmetricA = isSymmetricA;
-        pack_data.m = m;
-        pack_data.n = n;
-        pack_data.nnzA = nnzA;
-        MPI_Bcast(&pack_data, 1, newtype, 0, MPI_COMM_WORLD);
+    // Print A_i, A_j, A_data
+    // for (i = 0; i < num_rows + 1; i++) {
+    //     printf("A_i[%d]=%d\n", i, A_i[i]);
+    // }
+    // for (i = 0; i < num_nonzeros; i++) {
+    //     printf("A_j[%d]=%d, A_data[%d]=%lg\n", i, A_j[i], i, A_data[i]);
+    // }
+    // Test output of Matrix
+    // hypre_CSRMatrixPrintMM(test_A, 1,1, 0, "hypre_csr_test_A.mtx");
+
+    // Move data to device
+    HYPRE_Int *A_i_gpu = (HYPRE_Int *)gpu_malloc(sizeof(HYPRE_Int) * (num_rows + 1));
+    cudaMemcpy(A_i_gpu, A_i, sizeof(HYPRE_Int) * (num_rows + 1), cudaMemcpyHostToDevice);
+    hypre_CSRMatrixI(test_A) = A_i_gpu;
+    HYPRE_Int *A_j_gpu = (HYPRE_Int *)gpu_malloc(sizeof(HYPRE_Int) * nnz);
+    cudaMemcpy(A_j_gpu, A_j, sizeof(HYPRE_Int) * nnz, cudaMemcpyHostToDevice);
+    hypre_CSRMatrixJ(test_A) = A_j_gpu;
+    HYPRE_Complex *A_data_gpu = (HYPRE_Complex *)gpu_malloc(sizeof(HYPRE_Complex) * nnz);
+    cudaMemcpy(A_data_gpu, A_data, sizeof(HYPRE_Complex) * nnz, cudaMemcpyHostToDevice);
+    hypre_CSRMatrixData(test_A) = A_data_gpu;
+
+
+
+    //
+    // Create the dense vectors
+    //
+    HYPRE_Int vector_size = num_cols;
+
+    hypre_Vector *x = hypre_SeqVectorCreate(vector_size);
+    hypre_Vector *y = hypre_SeqVectorCreate(vector_size);
+
+    // Set memory type to device
+    hypre_VectorMemoryLocation(x) = HYPRE_MEMORY_DEVICE;
+    hypre_VectorMemoryLocation(y) = HYPRE_MEMORY_DEVICE;
+
+    // Initialize the vectors (this will handle the GPU memory allocation)
+    hypre_SeqVectorInitialize(x);
+    hypre_SeqVectorInitialize(y);
+    HYPRE_Complex *x_data = (HYPRE_Complex *)malloc(sizeof(HYPRE_Complex) * vector_size);
+    HYPRE_Complex *y_data = (HYPRE_Complex *)malloc(sizeof(HYPRE_Complex) * vector_size);
+    for(int i = 0; i < vector_size; i++){
+        x_data[i] = (HYPRE_Complex)1.0;
+        y_data[i] = (HYPRE_Complex)0.0;
     }
-    else
-    {
-        MPI_Bcast(&pack_data, 1, newtype, 0, MPI_COMM_WORLD);
-        isSymmetricA = pack_data.isSymmetricA;
-        m = pack_data.m;
-        n = pack_data.n;
-        nnzA = pack_data.nnzA;
-    }
+    HYPRE_Complex *x_data_gpu = (HYPRE_Complex *)gpu_malloc(sizeof(HYPRE_Complex) * vector_size);
+    HYPRE_Complex *y_data_gpu = (HYPRE_Complex *)gpu_malloc(sizeof(HYPRE_Complex) * vector_size);
+    // Transfer data to GPU
+    cudaMemcpy(x_data_gpu, x_data, sizeof(HYPRE_Complex) * vector_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(y_data_gpu, y_data, sizeof(HYPRE_Complex) * vector_size, cudaMemcpyHostToDevice);
+    hypre_VectorData(x) = x_data_gpu;
+    hypre_VectorData(y) = y_data_gpu;
+    hypre_SeqVectorInitialize(x);
+    hypre_SeqVectorInitialize(y);
 
-    /* Preliminaries: want at least one processor per row */
-    N = m; /* global number of rows */
-    /* Each processor knows only of its own rows - the range is denoted by ilower
-      and upper.  Here we partition the rows. We account for the fact that
-      N may not divide evenly by the number of processors. */
-    local_size = N / num_procs;
-    extra = N - local_size * num_procs;
+    // Prepare for SpMV kernel
+    HYPRE_Int trans = 0;
+    HYPRE_Int *trans_gpu = (HYPRE_Int *)gpu_malloc(sizeof(HYPRE_Int));
+    cudaMemcpy(trans_gpu, &trans, sizeof(HYPRE_Int), cudaMemcpyHostToDevice);
 
-    ilower = local_size * myid;
-    ilower += my_min(myid, extra);
-
-    iupper = local_size * (myid + 1);
-    iupper += my_min(myid + 1, extra);
-    iupper = iupper - 1;
-
-    /* How many rows do I have? */
-    local_size = iupper - ilower + 1;
-    HYPRE_IJMatrixRead("IJ.out.A", MPI_COMM_WORLD, HYPRE_PARCSR, &A);
-    // phgPrintf("  Read files to hypreA time: ");
-    // elapsed_time(TRUE, 0.);
-#endif
-    /* Note: for the testing of small problems, one may wish to read
-      in a matrix in IJ format (for the format, see the output files
-      from the -print_system option).
-      In this case, one would use the following routine:
-      HYPRE_IJMatrixRead( <filename>, MPI_COMM_WORLD,
-                          HYPRE_PARCSR, &A );
-      <filename>  = IJ.A.out to read in what has been printed out
-      by -print_system (processor numbers are omitted).
-      A call to HYPRE_IJMatrixRead is an *alternative* to the
-      following sequence of HYPRE_IJMatrix calls:
-      Create, SetObjectType, Initialize, SetValues, and Assemble
-   */
-
-    /* Get the parcsr matrix object to use */
-    HYPRE_IJMatrixGetObject(A, (void **)&parcsr_A);
-#if ReadMMFile
-    /* Create the rhs and solution */
-    HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &b);
-    HYPRE_IJVectorSetObjectType(b, HYPRE_PARCSR);
-    HYPRE_IJVectorInitialize(b);
-
-    HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &x);
-    HYPRE_IJVectorSetObjectType(x, HYPRE_PARCSR);
-    HYPRE_IJVectorInitialize(x);
-
-    /* Set the rhs values to h^2 and the solution to zero */
-    {
-        double *rhs_values, *x_values;
-        int *rows;
-
-        rhs_values = (double *)gpu_calloc(local_size, sizeof(double));
-        x_values = (double *)gpu_calloc(local_size, sizeof(double));
-        rows = (int *)gpu_calloc(local_size, sizeof(int));
-
-        for (i = 0; i < local_size; i++)
-        {
-            rhs_values[i] = bval[ilower + i];
-            x_values[i] = 0.0;
-            rows[i] = ilower + i;
-        }
-
-        printf("Setting b values too...\n");
-        HYPRE_IJVectorSetValues(b, local_size, rows, rhs_values);
-        HYPRE_IJVectorSetValues(x, local_size, rows, x_values);
-
-        // cudaFree(x_values);
-        // cudaFree(rhs_values);
-        // cudaFree(rows);
-        // cudaFree(bval);
-    }
+    HYPRE_Complex alpha = 1.0;
+    HYPRE_Complex *alpha_gpu = (HYPRE_Complex *)gpu_malloc(sizeof(HYPRE_Complex));
+    cudaMemcpy(alpha_gpu, &alpha, sizeof(HYPRE_Complex), cudaMemcpyHostToDevice);
+    HYPRE_Complex beta = 0.0;
+    HYPRE_Complex *beta_gpu = (HYPRE_Complex *)gpu_malloc(sizeof(HYPRE_Complex));
+    cudaMemcpy(beta_gpu, &beta, sizeof(HYPRE_Complex), cudaMemcpyHostToDevice);
+    HYPRE_Int offset = 0; // TODO: Check if this is correct
+    HYPRE_Int *offset_gpu = (HYPRE_Int *)gpu_malloc(sizeof(HYPRE_Int));
+    cudaMemcpy(offset_gpu, &offset, sizeof(HYPRE_Int), cudaMemcpyHostToDevice);
 
 
-    HYPRE_IJVectorAssemble(b);
-#else
-    /* Create the rhs and solution */
-    HYPRE_IJVectorCreate(MPI_COMM_WORLD, ilower, iupper, &x);
-    HYPRE_IJVectorSetObjectType(x, HYPRE_PARCSR);
-    HYPRE_IJVectorInitialize(x);
+    HYPRE_MemoryLocation memory_location  = hypre_CSRMatrixMemoryLocation(test_A);
+    // printf("Test A Memory location before migrate: %d\n", memory_location);
 
-    /* Set the rhs values to h^2 and the solution to zero */
-    {
-        double *x_values;
-        int *rows;
+    // Move data to device
+    hypre_CSRMatrixMigrate(test_A, HYPRE_MEMORY_DEVICE);
 
-        x_values = (double *)calloc(local_size, sizeof(double));
-        rows = (int *)calloc(local_size, sizeof(int));
+    memory_location  = hypre_CSRMatrixMemoryLocation(test_A);
+    // printf("Test A Memory location after migrate: %d\n", memory_location);
 
-        for (i = 0; i < local_size; i++)
-        {
-            x_values[i] = 0.0;
-            rows[i] = ilower + i;
-        }
+    memory_location  = hypre_VectorMemoryLocation(x);
+    // printf("Vec X Memory location after migrate: %d\n", memory_location);
 
-        HYPRE_IJVectorSetValues(x, local_size, rows, x_values);
+    memory_location  = hypre_VectorMemoryLocation(y);
+    // printf("Vec Y Memory location after migrate: %d\n", memory_location);
 
-        // free(x_values);
-        // free(rows);
-    }
-    HYPRE_IJVectorRead("IJ.out.b", MPI_COMM_WORLD, HYPRE_PARCSR, &b);
-#endif
-    /*  As with the matrix, for testing purposes, one may wish to read in a rhs:
-       HYPRE_IJVectorRead( <filename>, MPI_COMM_WORLD,
-                                 HYPRE_PARCSR, &b );
-       as an alternative to the
-       following sequence of HYPRE_IJVectors calls:
-       Create, SetObjectType, Initialize, SetValues, and Assemble
-   */
-    HYPRE_IJVectorGetObject(b, (void **)&par_b);
+    HYPRE_Complex *test_A_data = hypre_CSRMatrixData(test_A);
 
-    HYPRE_IJVectorAssemble(x);
-    HYPRE_IJVectorGetObject(x, (void **)&par_x);
-
-#if 1
-    /* PCG with AMG preconditioner */
-    {
-        int num_iterations;
-        int num_level;
-        double final_res_norm;
-        // 计时
-        struct timeval t_start, t_stop;
-        struct timeval t1, t2;
-        // gettimeofday(&t_start, NULL);
-
-        /* Create solver */
-        HYPRE_ParCSRPCGCreate(MPI_COMM_WORLD, &solver);
-
-        /* Set some parameters (See Reference Manual for more parameters) */
-        HYPRE_PCGSetMaxIter(solver, 300); /* max iterations */
-        HYPRE_PCGSetTol(solver, 1e-5);    /* conv. tolerance */
-        HYPRE_PCGSetTwoNorm(solver, 1);   /* use the two norm as the stopping criteria */
-
-        /* Now set up the AMG preconditioner and specify any parameters */
-        HYPRE_BoomerAMGCreate(&precond);
-        // HYPRE_BoomerAMGSetPrintLevel(precond, 3); /* print amg solution info */
-        HYPRE_BoomerAMGSetCoarsenType(precond, 8); // pmis
-        HYPRE_BoomerAMGSetMaxLevels(precond, 7);   // 对齐参数 //原10
-        HYPRE_BoomerAMGSetMaxRowSum(precond, 0.8); // 对齐参数  //原0.9
-        HYPRE_BoomerAMGSetStrongThreshold(precond, 0.25);
-        HYPRE_BoomerAMGSetNumFunctions(precond, 3);
-        HYPRE_BoomerAMGSetTruncFactor(precond, 0.1); // 对齐参数 //添加
-        HYPRE_BoomerAMGSetRelaxType(precond, 18);     // Jacobi
-        HYPRE_BoomerAMGSetNumSweeps(precond, 1);
-        HYPRE_BoomerAMGSetTol(precond, 1e-20); /* conv. tolerance zero */ // 对齐参数 //原 0.0
-        HYPRE_BoomerAMGSetMaxIter(precond, 50);
-        HYPRE_BoomerAMGSetMaxCoarseSize(precond, 3);
-        HYPRE_BoomerAMGSetCycleNumSweeps(precond, 3, 3);
-
-        HYPRE_Int interp_type = 6;      /* default value */
-        HYPRE_Int post_interp_type = 0; /* default value */
-        HYPRE_BoomerAMGSetInterpType(precond, interp_type); // extended + i
-        HYPRE_BoomerAMGSetRestriction(precond, 0);          // P^T
-        HYPRE_BoomerAMGSetPMaxElmts(precond, 4);
-        HYPRE_BoomerAMGSetCycleType(precond, 1); // V cycle
-
-        /* Now setup and solve! */
-        gettimeofday(&t_start, NULL);
-        HYPRE_BoomerAMGSetup(precond, parcsr_A, par_b, par_x);
-        gettimeofday(&t_stop, NULL);
-
-        gettimeofday(&t1, NULL);
-        HYPRE_BoomerAMGSolve(precond, parcsr_A, par_b, par_x);
-        gettimeofday(&t2, NULL);
-
-        double solve_time, total_solve_time;
-        total_solve_time = 0.0;
-
-        const char* nvtx_range_name = "AMGSolve_Loop";
-        nvtxRangeId_t r1 = nvtxRangeStartA(nvtx_range_name);
-        for(int time_iter=0; time_iter<num_time_iters; time_iter++){
-
-            gettimeofday(&t1, NULL);
-            HYPRE_BoomerAMGSolve(precond, parcsr_A, par_b, par_x);
-            gettimeofday(&t2, NULL);
-            solve_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
-            total_solve_time += solve_time;
-            printf("solve_time=%.5lf\n", solve_time);
-
-        }
-        nvtxRangeEnd(r1);
-        // nvtxRangePop();
+    // For better profiling, optionally allocate memory for sparse matrix to in total lead to dense matrix memory allocation
+    // long num_zeros = num_rows * num_cols - nnz;
+    // HYPRE_Complex *zeros = (HYPRE_Complex *)malloc(sizeof(HYPRE_Complex) * num_zeros);
+    // for(int i = 0; i < num_zeros; i++){
+    //     zeros[i] = (HYPRE_Complex)0.0;
+    // }
+    // HYPRE_Complex *zeros_gpu = (HYPRE_Complex *)gpu_malloc(sizeof(HYPRE_Complex) * num_zeros);
+    // cudaMemcpy(zeros_gpu, zeros, sizeof(HYPRE_Complex) * num_zeros, cudaMemcpyHostToDevice);
 
 
-        /* Run info - needed logging turned on */
-        HYPRE_BoomerAMGGetNumIterations(precond, &num_iterations);
-        HYPRE_BoomerAMGGetFinalRelativeResidualNorm(precond, &final_res_norm);
+    printf("Invoking SpMV kernels once before profiling\n");
+    // y = alpha * A * x + beta * y
+    spmv_amgT_fp64(trans,
+                    alpha,
+                    test_A,
+                    x,
+                    beta,
+                    y,
+                    offset);
 
-        if (myid == 0)
-        {
-            printf("\n");
-            printf("Iterations = %d\n", num_iterations);
-            printf("Final Relative Residual Norm = %e\n", final_res_norm);
-            double setup_time = (t_stop.tv_sec - t_start.tv_sec) * 1000.0 + (t_stop.tv_usec - t_start.tv_usec) / 1000.0;
-            solve_time = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
-            printf("setup_time=%.5lf\n", setup_time);
-            printf("solve_time=%.5lf\n", solve_time);
-            printf("time_spmv_sum=%.5lf\n", time_spmv_sum);
-            printf("time_spmv=%.5lf\n", time_spmv);
-            printf("time_spmv_preprocess=%.5lf\n", time_spmv_preprocess);
-            printf("spmv_times=%d\n", spmv_times);
-            printf("time_spgemm=%.5lf\n", time_spgemm);
-            printf("time_spgemm_preprocess=%.5lf\n", time_spgemm_preprocess);
-            // printf("cusparse_spgemm_time=%.5lf\n", cusparse_spgemm_time);
-            printf("spgemm_times=%d\n", spgemm_times);
-            printf("time_spgemm_all=%.5lf\n", time_spgemm_all);
+    spmv_amgT_fp64_CC(trans,
+                    alpha,
+                    test_A,
+                    x,
+                    beta,
+                    y,
+                    offset);
 
-            printf("csr2bsr_step1=%.5lf\n", csr2bsr_step1);
-            printf("csr2bsr_step2=%.5lf\n", csr2bsr_step2);
-            printf("csr2bsr_step3=%.5lf\n", csr2bsr_step3);
-            printf("bsr2csr_step1=%.5lf\n", bsr2csr_step1);
-            printf("bsr2csr_step2=%.5lf\n", bsr2csr_step2);
-            printf("bsr2csr_step3=%.5lf\n", bsr2csr_step3);
+    spmv_amgT_fp64_TC(trans,
+                    alpha,
+                    test_A,
+                    x,
+                    beta,
+                    y,
+                    offset);
 
-            printf("Average Solve Time: %f  (N=%d)\n", total_solve_time / num_time_iters, num_time_iters);
-            printf("\n");
+
+    // -----------Cusparse setup ------------------------------------------------------------
+    // HYPRE_Int num_vectors = hypre_VectorNumVectors(x);
+    // hypre_CSRMatrix *AT;
+    // hypre_CSRMatrix *B;
+    // /* SpMV data */
+    // size_t bufferSize = 0;
+    // char *dBuffer = hypre_CSRMatrixGPUMatSpMVBuffer(test_A);
+    // cusparseHandle_t handle = hypre_HandleCusparseHandle(hypre_handle());
+    // const cudaDataType data_type = hypre_HYPREComplexToCudaDataType();
+    // const cusparseIndexType_t index_type = hypre_HYPREIntToCusparseIndexType();
+
+    // /* Local cusparse descriptor variables */
+    // cusparseSpMatDescr_t matA;
+    // cusparseDnVecDescr_t vecX, vecY;
+    // cusparseDnMatDescr_t matX, matY;
+
+    // B = test_A;
+
+    // /* Create cuSPARSE vector data structures */
+    // matA = hypre_CSRMatrixToCusparseSpMat(B, offset);
+
+    // vecX = hypre_VectorToCusparseDnVec(x, 0, num_cols);
+    // vecY = hypre_VectorToCusparseDnVec(y, offset, num_rows - offset);
+
+    // if (!dBuffer)
+    // {
+    //     HYPRE_CUSPARSE_CALL(cusparseSpMV_bufferSize(handle,
+    //                                                 CUSPARSE_OPERATION_NON_TRANSPOSE,
+    //                                                 &alpha,
+    //                                                 matA,
+    //                                                 vecX,
+    //                                                 &beta,
+    //                                                 vecY,
+    //                                                 data_type,
+    //                                                 HYPRE_CUSPARSE_SPMV_ALG,
+    //                                                 &bufferSize));
+
+    //     dBuffer = hypre_TAlloc(char, bufferSize, HYPRE_MEMORY_DEVICE);
+    //     hypre_CSRMatrixGPUMatSpMVBuffer(test_A) = dBuffer;
+    // }
+
+    // cusparseSpMV(handle,
+    //                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
+    //                                     &alpha,
+    //                                     matA,
+    //                                     vecX,
+    //                                     &beta,
+    //                                     vecY,
+    //                                     data_type,
+    //                                     HYPRE_CUSPARSE_SPMV_ALG,
+    //                                     dBuffer);
+    // // cudaDeviceSynchronize()
+    // hypre_SyncComputeStream(hypre_handle());
+    hypre_CSRMatrixMatvecCusparseNewAPI_Cusparse(trans,
+                                                alpha,
+                                                test_A,
+                                                x,
+                                                beta,
+                                                y,
+                                                offset);
+
+    /* Free memory */
+    // HYPRE_CUSPARSE_CALL(cusparseDestroySpMat(matA));
+    // HYPRE_CUSPARSE_CALL(cusparseDestroyDnVec(vecX));
+    // HYPRE_CUSPARSE_CALL(cusparseDestroyDnVec(vecY));
+    // ------------ End of Cusparse ------------
+
+    // Copy back and print y
+    // cudaMemcpy(y_data, hypre_VectorData(y), sizeof(HYPRE_Complex) * vector_size, cudaMemcpyDeviceToHost);
+    // cudaMemcpy(y_data_gpu, y_data, sizeof(HYPRE_Complex) * vector_size, cudaMemcpyHostToDevice);
+
+    // for(int i = 0; i < vector_size; i++){
+    //     printf("y[%d]=%lg\n", i, y_data[i]);
+    // }
+
+    // Profiling
+    double *trial_times = (double*)malloc(num_trials * sizeof(double));
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float milliseconds;
+
+    // Register NVTX string
+    nvtxDomainHandle_t profiling_domain = nvtxDomainCreateA("profiling");
+    nvtxStringHandle_t profiling_string = nvtxDomainRegisterStringA(profiling_domain, "profiling");
+    nvtxEventAttributes_t evtAttr = {0};
+    evtAttr.version = NVTX_VERSION;
+    evtAttr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    evtAttr.messageType = NVTX_MESSAGE_TYPE_REGISTERED;
+    evtAttr.message.registered = profiling_string;
+
+
+    cudaDeviceSynchronize();
+    /* Create thread to gather GPU stats */
+    std::thread threadStart( &nvmlClass::getStats,
+                            &nvml);  // threadStart starts running
+    printf("Profiling...\n");
+    sleep(2);
+    // Create array to store timing data
+
+    // Track total profiling time
+    // time_t start_time = time(NULL);
+    // const int MAX_PROFILE_SECONDS = 30; // Cut off after 30 seconds
+    // bool timeout = false;
+
+    // nvtxRangePushA("benchmarking");
+    nvtxDomainRangePushEx(profiling_domain, &evtAttr);
+    for(int i = 0; i < num_trials; i++){
+        cudaEventRecord(start);
+        if(kernel_type_int == 0){
+            spmv_amgT_fp64_TC(trans,
+                    alpha,
+                    test_A,
+                    x,
+                    beta,
+                    y,
+                    offset);
+        }else if(kernel_type_int == 1){
+            spmv_amgT_fp64_CC(trans,
+                    alpha,
+                    test_A,
+                    x,
+                    beta,
+                    y,
+                    offset);
+        }else if(kernel_type_int == 2){
+                hypre_CSRMatrixMatvecCusparseNewAPI_Cusparse(trans,
+                                                            alpha,
+                                                            test_A,
+                                                            x,
+                                                            beta,
+                                                            y,
+                                                            offset);
+                cudaDeviceSynchronize();
         }
 
-        /* Destroy solver and preconditioner */
-        HYPRE_ParCSRPCGDestroy(solver);
-        HYPRE_BoomerAMGDestroy(precond);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        trial_times[i] = milliseconds;
     }
-#endif
+    CUDA_RT_CALL(cudaDeviceSynchronize());
+    // nvtxRangePop();
+    // cudaProfilerStop();
+    nvtxDomainRangePop(profiling_domain);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    sleep(2);
+    /* Create thread to kill GPU stats */
+    /* Join both threads to main */
+    std::thread threadKill( &nvmlClass::killThread, &nvml );
+    threadStart.join( );
+    threadKill.join( );
+    printf("Profiling done\n");
 
-    /* Clean up */
-    HYPRE_IJMatrixDestroy(A);
-    HYPRE_IJVectorDestroy(b);
-    HYPRE_IJVectorDestroy(x);
+    // Write timing data to CSV file
+    char time_stats_path[1024];
+    snprintf(time_stats_path, sizeof(time_stats_path), "%s/%s", dir_path, "timeStats.csv");
+    FILE *fp = fopen(time_stats_path, "w");
+    fprintf(fp, "trial,time_ms\n");
+    for(int i = 0; i < num_trials; i++) {
+        fprintf(fp, "%d,%f\n", i, trial_times[i]);
+    }
+    fclose(fp);
+    free(trial_times);
 
-    /* Finalize HYPRE */
-    // HYPRE_Finalize();
 
-    /* Finalize MPI*/
+    HYPRE_Finalize();
+    nvmlShutdown();
     MPI_Finalize();
 
     return 0;

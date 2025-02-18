@@ -21,17 +21,17 @@ export HYPRE_DIR=${HYPRE_HOME}/hypre
 #end config
 
 # choose the execuative verison: AmgT_FP64, AmgT_Mixed, cuSPARSE
-execuative=cuSPARSE
+# execuative=AmgT_FP64
 
 #compile the AmgT_HYPRE
-cp ${pwd_file}/config_files/${execuative}.h ${HYPRE_HOME}/seq_mv/seq_mv.h
-echo ${pwd_file}/config_files/${execuative}.h
+# cp ${pwd_file}/config_files/${execuative}.h ${HYPRE_HOME}/seq_mv/seq_mv.h
+# echo ${pwd_file}/config_files/${execuative}.h
 cd ${HYPRE_HOME}
 make install -j 1
 
 #compile the test file
 cd ${pwd_file}/AmgT_test
 make clean && make test_new
-mv test_new ${pwd_file}/AmgT_test/runnable_files/${execuative}
+# mv test_new ${pwd_file}/AmgT_test/runnable_files/${execuative}
 
 

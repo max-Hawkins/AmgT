@@ -16,7 +16,7 @@
 
 #include "_hypre_utilities.h"
 #define gettimeofday1(a, b)      \
-    \ 
+    \
         cudaDeviceSynchronize(); \
     gettimeofday(a, b)
 #ifdef __cplusplus
@@ -64,9 +64,13 @@ struct hypre_GpuMatData;
 typedef struct hypre_GpuMatData hypre_GpuMatData;
 #endif
 
-// #define Hypre_AMGT
+#define Hypre_AMGT
 
-// #define ADAPTIVE_AMGT_SPMV
+#define ADAPTIVE_AMGT_SPMV
+//TODO: Remove if not working
+#define HYPRE_USING_CUSPARSE
+
+#define TC_AMGT_SPMV
 
 // #define MIXED_PRESION
 
@@ -808,6 +812,28 @@ HYPRE_Int hypre_CSRMatrixSpMVDevice( HYPRE_Int trans, HYPRE_Complex alpha, hypre
                         HYPRE_Complex beta,
                         hypre_Vector *y,
                         HYPRE_Int offset);
+    void spmv_amgT_fp64_CC(HYPRE_Int trans,
+                        HYPRE_Complex alpha,
+                        hypre_CSRMatrix *A,
+                        hypre_Vector *x,
+                        HYPRE_Complex beta,
+                        hypre_Vector *y,
+                        HYPRE_Int offset);
+    void spmv_amgT_fp64_TC(HYPRE_Int trans,
+                        HYPRE_Complex alpha,
+                        hypre_CSRMatrix *A,
+                        hypre_Vector *x,
+                        HYPRE_Complex beta,
+                        hypre_Vector *y,
+                        HYPRE_Int offset);
+
+    HYPRE_Int hypre_CSRMatrixMatvecCusparseNewAPI_Cusparse(HYPRE_Int trans,
+                HYPRE_Complex alpha,
+                hypre_CSRMatrix *A,
+                hypre_Vector *x,
+                HYPRE_Complex beta,
+                hypre_Vector *y,
+                HYPRE_Int offset);
 
     void spmv_amgT_fp32(HYPRE_Int trans,
                         HYPRE_Complex alpha,
@@ -827,9 +853,9 @@ HYPRE_Int hypre_CSRMatrixSpMVDevice( HYPRE_Int trans, HYPRE_Complex alpha, hypre
     __global__ void bsr_val_fp64_to_32(MAT_VAL_TYPE *fp64_val_csr, float *fp32_val_bsr, int nnz);
     __global__ void bsr_val_fp64_to_16(MAT_VAL_TYPE *fp64_val_csr, uint32_t *fp16_val_bsr, int nnz);
 
-#if defined(HYPRE_USING_CUSPARSE)  ||\
-    defined(HYPRE_USING_ROCSPARSE) ||\
-    defined(HYPRE_USING_ONEMKLSPARSE)
+// #if defined(HYPRE_USING_CUSPARSE)  ||\
+//     defined(HYPRE_USING_ROCSPARSE) ||\
+//     defined(HYPRE_USING_ONEMKLSPARSE)
 hypre_CsrsvData* hypre_CsrsvDataCreate();
 HYPRE_Int hypre_CsrsvDataDestroy(hypre_CsrsvData *data);
 hypre_GpuMatData* hypre_GpuMatDataCreate();
@@ -841,7 +867,7 @@ hypre_GpuMatData* hypre_CSRMatrixGetGPUMatData(hypre_CSRMatrix *matrix);
 #define hypre_CSRMatrixGPUMatInfo(matrix)        ( hypre_GpuMatDataMatInfo (hypre_CSRMatrixGetGPUMatData(matrix)) )
 #define hypre_CSRMatrixGPUMatHandle(matrix)      ( hypre_GpuMatDataMatHandle (hypre_CSRMatrixGetGPUMatData(matrix)) )
 #define hypre_CSRMatrixGPUMatSpMVBuffer(matrix)  ( hypre_GpuMatDataSpMVBuffer (hypre_CSRMatrixGetGPUMatData(matrix)) )
-#endif
+// #endif
 
 HYPRE_Int hypre_CSRMatrixSpMVAnalysisDevice(hypre_CSRMatrix *matrix);
 

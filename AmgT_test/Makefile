@@ -14,7 +14,7 @@
 ########################################################################
 CC        = mpicc
 F77       = mpif77
-CXX       = mpicxx
+CXX       = nvc++
 F90       = mpifort
 # CUDA_HOME = /usr/local/cuda-12.0
 #XL_DIR=$(dir $(shell which xlc))..
@@ -22,7 +22,7 @@ F90       = mpifort
 # # CUDA
 # ########################################################################
    CUDA_INCL = -I${CUDA_HOME}/include
-   CUDA_LIBS = -L${CUDA_HOME}/lib64 -lcudart -lcublas -lcusparse -lcurand -lstdc++ #-L$(XL_DIR)/xlC/16.1.1/lib -libmc++
+   CUDA_LIBS = -L${CUDA_HOME}/lib64 -lcudart -lcublas -lcusparse -lcurand -lstdc++ -lnvidia-ml #-L$(XL_DIR)/xlC/16.1.1/lib -libmc++
 #    CUDA_ARCH = -gencode arch=compute_80,code=sm_80 -gencode arch=compute_80,code=sm_80
    NVCC_LDFLAGS = -ccbin=${CXX} ${CUDA_ARCH}
    COPTS_CUDA = -DHYPRE_EXAMPLE_USING_CUDA -DH_TIME
@@ -71,7 +71,7 @@ LFLAGS90 =
 .SUFFIXES: .c .f .cxx .f90
 
 .c.o:
-	$(CC) $(CFLAGS) -c $<
+	$(CXX) $(CFLAGS) -c $<
 .f.o:
 	$(F77) $(FFLAGS) -c $<
 .cxx.o:
@@ -90,7 +90,7 @@ default: all
 # Example 1
 ########################################################################
 test: test.o
-	$(CC) -o $@ $^ $(LFLAGS)
+	$(CXX) -o $@ $^ $(LFLAGS)
 test_new: test_new.o
 	$(CC) -o $@ $^ $(LFLAGS)
 ########################################################################
